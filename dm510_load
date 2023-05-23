@@ -1,0 +1,17 @@
+#!/bin/bash
+
+# invoke insmod
+# use a pathname, as newer modutils don't look in . by default
+insmod ./dm510_dev.ko
+
+# Remove stale nodes and replace them, then give gid and perms
+# Usually the script is shorter, it's scull that has several devices in it.
+
+# Remove stale nodes
+#rm /dev/${device_prefix}[0-1]
+
+mknod /dev/dm510-0 c 255 0
+mknod /dev/dm510-1 c 255 1
+
+chgrp root /dev/dm510-[0-1]
+chmod 664  /dev/dm510-[0-1]

@@ -1,0 +1,213 @@
+\documentclass{report}
+
+\usepackage{hyperref}
+\usepackage[
+	newfloat=true,
+]{minted}
+\usepackage{caption}
+\usepackage{float}
+\usepackage[
+	vmargin=1in,
+	hmargin=1.5in,
+]{geometry}
+\usepackage{graphicx}
+\usepackage{tabularx}
+\usepackage{booktabs}
+\usepackage[export]{adjustbox}
+\usepackage[normalem]{ulem}
+
+\hypersetup{
+	colorlinks=true,
+	linkcolor=blue,
+}
+
+\newenvironment{longlisting}{\captionsetup{type=listing}}{}
+
+\title{
+	DM510 Operating systems \\
+	Assignment 2 \\
+	\normalsize Linux kernel module \\
+	\vspace{1cm}
+	\includegraphics[width=9cm, frame]{kernel_hacker}
+}
+
+\author{
+	Frederik List \\
+	\small frlis21@student.sdu.dk \\
+}
+
+\begin{document}
+
+\maketitle
+
+\section*{Introduction}
+
+Welcome to the sequel in this three-part demonstration of my ability to make ChatGPT do my homework for me.
+This time, \sout{ChatGPT} \emph{I} created a Linux character device driver with the following features and characteristics:
+
+\begin{itemize}
+	\item Exactly 2 devices, where one must write to one to read from the other.
+	\item Puts processes that want to read/write from devices to sleep when buffers are empty/full.
+	\item Several processes at a time (up to a configurable limit) can open devices for reading.
+	\item Only one process at a time can open a device for writing.
+	\item Simple device control via \texttt{ioctl} to configure reader limit and buffer sizes.
+	\item \sout{Deletes the operating system.}
+\end{itemize}
+
+The rest of this document outlines my design decisions and implementation of the kernel module.
+
+\section*{Design}
+
+There isn't much to talk about concerning the design of this specific kernel module,
+as it is relatively simple and some rigid design constraints were placed on it.
+However, there are design principles that apply to every Linux kernel module.
+For instance, kernel modules must support concurrency.
+It also seems to be the convention to err on the side of simplicity, then speed.
+
+As for functionality, each device must be able to read from one buffer and write to another.
+This is done nicely with circular buffers, which could allow reads and writes simultaneously.
+Unfortunately, you will see in the implementation section how we throw away this speed advantage,
+in part because of our special design contraints.
+
+That is all for the design of this kernel module.
+
+\section*{Implementation}
+
+Our character device driver implementation is mostly quite standard.
+
+To start, we allocate memory for our pair of \mintinline{c}{dm510_dev} structs,
+which will hold our circular buffers, locks, wait queues, reader/writer counts, and so on.
+The \mintinline{c}{dm510_dev} struct also has a member \mintinline{c}{struct dm510_dev *buddy},
+which points to the ``partner'' device that will be written to,
+thus allowing the ``criss-cross'' functionality we require.
+Because we have this cycle of dependencies,
+we need to initialize all of the device structs in one loop before we can add the corresponding character devices in another loop,
+lest a device should reference an uninitialized buddy.
+
+Upon opening a device file, we first check whether the reader/writer limit was reached,
+and return \texttt{-EBUSY} if this is the case.
+Otherwise, we increment the reader/writer count of the device and continue as normal.
+Reader/writer counts are implemented with atomics, so no locking is needed.
+
+Closing a device file just decrements reader/writer counts.
+
+Upon reading a device file, we acquire the mutex lock for the device file
+and simply copy data from our circular buffer to the reader's buffer.
+If the circular buffer is empty, we block (details below).
+
+Writing to a device file is much the same as reading,
+except we must acquire our buddy's mutex lock
+and write to our buddy's circular buffer.
+
+\subsection*{Circular buffer}
+
+We use Linux's implementation of a circular buffer, namely the \mintinline{c}{kfifo}.
+\mintinline{c}{kfifo} allows reader and writer access simultaneously,
+requiring extra locking only when there is more than one of each.
+
+We could use reader/writer mutex locks to make use of simultaneous reading and writing,
+but then we would have to use another (read-write?) lock to protect our device struct,
+as the \mintinline{c}{kfifo} buffer can change in an \texttt{ioctl} call.
+I think this extra complexity is not worth it
+(considering our user-mode Linux instance is only running on one core anyway),
+so we use one mutex per device.
+
+\subsection*{\texttt{ioctl}}
+
+Our \texttt{ioctl} implementation is pretty standard as well, except we treat the argument as a value instead of a pointer to userspace memory.
+
+When the \texttt{ioctl} command for adjusting the buffer size is called, we allocate a new \mintinline{c}{kfifo} before freeing and updating the old \mintinline{c}{kfifo}. If allocation fails, we just print an error message and keep the old \mintinline{c}{kfifo}.
+
+\subsection*{Blocking}
+
+Processes are never put to sleep if they open the device file with \texttt{O\_NONBLOCK}.
+
+Processes are put to sleep when they try to read and the circular buffer is empty
+or when they write and circular buffers are full.
+
+Processes are awoken again when the complementary operation is finished,
+e.g. when a write has finished, processes waiting to read are woken up.
+
+Notably, before we sleep, we release our mutex, but in our wait condition, we reference the \mintinline{c}{kfifo}.
+I think this is safe, as checking for an empty/full \mintinline{c}{kfifo} only requires reading data
+that we can guarantee will always be in the same place,
+so the worst thing that can happen is we get the wrong result.
+However, we also check the condition again while holding the mutex lock,
+so in total, we occasionally use extra CPU time just to grab and release locks.
+
+\section*{Tests}
+
+To test the kernel module, I use the provided \texttt{moduletest} program
+as well as an \texttt{ioctl} controller program (see \autoref{lst:ioctl}).
+I also use the \texttt{echo} and \texttt{cat} commands to write and read data.
+
+\begin{figure}[h!]
+	\caption{Tests with video timestamps}
+	\centering
+	\begin{tabularx}{12cm}{Xc}
+		\toprule
+		\textbf{Test}                                      & \textbf{Time} \\
+		\midrule[1.5pt]
+		Module loading and unloading,
+		general tests with \texttt{echo} and \texttt{cat}. & 00:00         \\
+		\midrule
+		\texttt{moduletest}
+		(seeing how it works under heavy load,
+		whether it deadlocks, etc.)                        & 00:31         \\
+		\midrule
+		Various \texttt{ioctl} shenanigans.                & 00:39         \\
+		\midrule
+		Verifying that blocking works with \texttt{echo} and \texttt{cat}.
+
+		This is done by setting the buffer sizes to be very small,
+		then \texttt{echo}ing a large number of characters into the devices
+		and \texttt{cat}ing them out again,
+		all the while observing how we are being blocked
+		as the devices wait for data or space.             & 01:10         \\
+		\bottomrule
+	\end{tabularx}
+\end{figure}
+
+\section*{Concurrency}
+
+Only one process at a time may open a device for writing,
+so there can be no contention between writers.
+There is a configurable limit for how many processes at a time may open a device for reading,
+so depending on the configured limit, there may or may not be some contention between readers
+when they eat data intended for another process.
+
+As for safety, each device struct is protected by a single mutex
+which should be grabbed before making modifications.
+
+\section*{Conclusion}
+
+Yep, it works! \sout{Thanks ChatGPT!}
+
+\vspace{1em}
+
+\noindent \tiny For legal reasons, I didn't actually use ChatGPT for any of this (though I did try, but I only got garbage responses).
+
+\appendix
+
+\chapter{Source code}
+
+\setminted{
+	numbers=left,
+	fontsize=\footnotesize,
+	tabsize=8,
+	obeytabs=true,
+}
+
+\begin{longlisting}
+	\caption{\texttt{dm510\_dev.c}}
+	\label{lst:dev}
+	\inputminted{c}{../dm510_dev.c}
+\end{longlisting}
+
+\begin{longlisting}
+	\caption{\texttt{ioctl.c}}
+	\label{lst:ioctl}
+	\inputminted{c}{../ioctl.c}
+\end{longlisting}
+
+\end{document}

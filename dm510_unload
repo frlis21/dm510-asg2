@@ -1,0 +1,7 @@
+#!/bin/bash
+
+# invoke rmmod with all arguments we got
+rmmod dm510_dev
+
+# Remove stale nodes
+rm /dev/dm510*
